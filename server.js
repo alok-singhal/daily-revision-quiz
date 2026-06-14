@@ -13,7 +13,6 @@ const YEAR3_RESULTS_PATH = path.join(__dirname, "year3_results.json");
 const PORT = process.env.PORT || 3000;
 
 // ============== EMAIL CONFIG ==============
-const TO_EMAIL = "alok.singhal2703@gmail.com";
 const QUIZ_URL = "https://daily-revision-quiz.onrender.com";
 
 function getGmailAuth() {
@@ -26,12 +25,12 @@ function getGmailAuth() {
   return oAuth2Client;
 }
 
-async function sendEmail(subject, body) {
+async function sendEmail(toEmail, subject, body) {
   const auth = getGmailAuth();
   if (!auth) { console.error("❌ Gmail credentials not configured"); return false; }
   const gmail = google.gmail({ version: "v1", auth });
   const message = [
-    `To: ${TO_EMAIL}`,
+    `To: ${toEmail}`,
     `Subject: =?UTF-8?B?${Buffer.from(subject).toString("base64")}?=`,
     `Content-Type: text/plain; charset=utf-8`,
     `Content-Transfer-Encoding: base64`,
@@ -41,10 +40,10 @@ async function sendEmail(subject, body) {
   const encodedMessage = Buffer.from(message).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
   try {
     await gmail.users.messages.send({ userId: "me", requestBody: { raw: encodedMessage } });
-    console.log(`✅ Email sent: ${subject}`);
+    console.log(`✅ Email sent to ${toEmail}: ${subject}`);
     return true;
   } catch (err) {
-    console.error("❌ Failed to send email:", err.message);
+    console.error(`❌ Failed to send email to ${toEmail}:`, err.message);
     return false;
   }
 }
@@ -52,8 +51,14 @@ async function sendEmail(subject, body) {
 async function sendDailyEmails() {
   const today = new Date().toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" });
   const config = getConfig();
-  const body1 = `\n📚 DAILY REVISION - ${today}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🎯 ${config.year8.name}'s Quiz: ${QUIZ_URL}/\n(${config.year8.questionsPerQuiz} MCQs - AI Generated!)\n\n🎯 ${config.year3.name}'s Quiz: ${QUIZ_URL}/year3\n(${config.year3.questionsPerQuiz} MCQs - AI Generated!)\n\n💡 Fresh questions every day!\nGood luck! 🚀\n`;
-  await sendEmail(`📚 Daily Revision - ${today}`, body1);
+  
+  // Send personalized email to each user
+  for (const [userName, userConfig] of Object.entries(config)) {
+    const quizUrl = `${QUIZ_URL}/quiz/${userName}`;
+    const body = `\n📚 DAILY REVISION - ${today}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🎯 Hi ${userName}!\n\nYour daily quiz is ready: ${quizUrl}\n(${userConfig.questionsPerQuiz} MCQs - AI Generated!)\n\n💡 Fresh questions every day!\nGood luck! 🚀\n`;
+    
+    await sendEmail(userConfig.email, `📚 Daily Revision - ${today}`, body);
+  }
 }
 
 
@@ -63,19 +68,19 @@ function getConfig() {
 }
 
 // Generate questions from Gemini REST API based on config topics
-async function generateQuestionsFromGemini(yearKey) {
+async function generateQuestionsFromGemini(userName) {
   const config = getConfig();
-  const yearConfig = config[yearKey];
-  const totalQuestions = yearConfig.questionsPerQuiz;
+  const userConfig = config[userName];
+  if (!userConfig) throw new Error(`User ${userName} not found in config`);
+  
+  const totalQuestions = userConfig.questionsPerQuiz;
   const apiKey = process.env.GEMINI_API_KEY;
 
-  const topicsList = Object.entries(yearConfig.subjects)
+  const topicsList = Object.entries(userConfig.subjects)
     .map(([subject, topics]) => `${subject}: ${topics.join(", ")}`)
     .join("\n");
 
-  const yearLabel = yearKey === "year8" ? "Year 8" : "Year 3";
-
-  const prompt = `Generate exactly ${totalQuestions} multiple choice questions for a ${yearLabel} student.
+  const prompt = `Generate exactly ${totalQuestions} multiple choice questions for a ${userConfig.year} student.
 
 Topics to cover (spread questions evenly across all topics):
 ${topicsList}
@@ -87,58 +92,66 @@ Return ONLY a valid JSON array with no extra text. Each object must have:
 - "topic": the topic name (e.g. "Algebra", "Forces")
 - "subject": the subject name (e.g. "maths", "science")
 
-Make questions age-appropriate for ${yearLabel}. Mix easy and medium difficulty. No duplicate questions.`;
+Make questions age-appropriate for ${userConfig.year}. Mix easy and medium difficulty. No duplicate questions.`;
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
-  });
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`;
+  
+  // Retry logic for quota exceeded errors
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const resp = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
+      });
 
-  if (!resp.ok) throw new Error(`Gemini API error: ${resp.status} ${await resp.text()}`);
+      if (resp.status === 429) {
+        const retryAfter = Math.pow(2, attempt) * 1000;
+        console.log(`⏳ Quota exceeded, retrying in ${retryAfter}ms (attempt ${attempt}/3)`);
+        await new Promise(resolve => setTimeout(resolve, retryAfter));
+        continue;
+      }
 
-  const data = await resp.json();
-  const text = data.candidates[0].content.parts[0].text;
+      if (!resp.ok) throw new Error(`Gemini API error: ${resp.status} ${await resp.text()}`);
 
-  const jsonMatch = text.match(/\[[\s\S]*\]/);
-  if (!jsonMatch) throw new Error("Failed to parse Gemini response");
+      const data = await resp.json();
+      const text = data.candidates[0].content.parts[0].text;
 
-  return JSON.parse(jsonMatch[0]).slice(0, totalQuestions);
+      const jsonMatch = text.match(/\[[\s\S]*\]/);
+      if (!jsonMatch) throw new Error("Failed to parse Gemini response");
+
+      return JSON.parse(jsonMatch[0]).slice(0, totalQuestions);
+    } catch (err) {
+      if (attempt === 3) throw err;
+      console.log(`⚠️ Attempt ${attempt} failed: ${err.message}`);
+    }
+  }
 }
 
 // ---- Results helpers ----
-function getResults() {
-  if (fs.existsSync(RESULTS_PATH)) return JSON.parse(fs.readFileSync(RESULTS_PATH, "utf-8"));
+function getResults(userName) {
+  const resultsPath = path.join(__dirname, `${userName}_results.json`);
+  if (fs.existsSync(resultsPath)) return JSON.parse(fs.readFileSync(resultsPath, "utf-8"));
   return [];
 }
-function saveResult(result) {
-  const results = getResults();
+function saveResult(userName, result) {
+  const resultsPath = path.join(__dirname, `${userName}_results.json`);
+  const results = getResults(userName);
   results.push(result);
-  fs.writeFileSync(RESULTS_PATH, JSON.stringify(results, null, 2));
-}
-function getYear3Results() {
-  if (fs.existsSync(YEAR3_RESULTS_PATH)) return JSON.parse(fs.readFileSync(YEAR3_RESULTS_PATH, "utf-8"));
-  return [];
-}
-function saveYear3Result(result) {
-  const results = getYear3Results();
-  results.push(result);
-  fs.writeFileSync(YEAR3_RESULTS_PATH, JSON.stringify(results, null, 2));
+  fs.writeFileSync(resultsPath, JSON.stringify(results, null, 2));
 }
 
 // ---- Quiz HTML renderer ----
-function renderQuizPage(quiz, yearKey, lastScore, config) {
-  const yearConfig = config[yearKey];
-  const isYear8 = yearKey === "year8";
-  const title = isYear8 ? "📚 Daily Revision Quiz" : "📝 Year 3 Test";
-  const subtitle = isYear8 ? `Year 8 — ${yearConfig.name}` : `Year 3 — ${yearConfig.name}`;
-  const gradientBg = isYear8 ? "linear-gradient(135deg, #667eea 0%, #764ba2 100%)" : "linear-gradient(135deg, #f093fb 0%, #f5576c 100%)";
-  const tagColor = isYear8 ? "#667eea" : "#f5576c";
-  const hoverBorder = isYear8 ? "#667eea" : "#f5576c";
-  const hoverBg = isYear8 ? "#f5f3ff" : "#fff0f3";
-  const btnBg = isYear8 ? "#667eea" : "#f5576c";
-  const submitAction = isYear8 ? "/submit" : "/year3/submit";
+function renderQuizPage(quiz, userName, lastScore, config) {
+  const userConfig = config[userName];
+  const title = `📚 Daily Revision Quiz`;
+  const subtitle = `${userConfig.year} — ${userName}`;
+  const gradientBg = "linear-gradient(135deg, #667eea 0%, #764ba2 100%)";
+  const tagColor = "#667eea";
+  const hoverBorder = "#667eea";
+  const hoverBg = "#f5f3ff";
+  const btnBg = "#667eea";
+  const submitAction = `/submit/${userName}`;
 
   let html = `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
   <title>${title}</title>
@@ -189,21 +202,19 @@ function renderQuizPage(quiz, yearKey, lastScore, config) {
   return html;
 }
 
-function renderResultPage(correct, total, topicScores, yearKey, config) {
-  const yearConfig = config[yearKey];
-  const isYear8 = yearKey === "year8";
-  const name = yearConfig.name;
+function renderResultPage(correct, total, topicScores, userName, config) {
+  const userConfig = config[userName];
   const totalPercent = Math.round((correct / total) * 100);
-  const retryLink = isYear8 ? "/" : "/year3";
+  const retryLink = `/quiz/${userName}`;
 
   let motivationMsg;
-  if (totalPercent === 100) motivationMsg = `${name} you are AMAZING! 🌟 100% - Perfect score!`;
-  else if (totalPercent >= 90) motivationMsg = `${name} you are BRILLIANT! 🎉 Keep shining!`;
-  else if (totalPercent >= 80) motivationMsg = `${name} you are GREAT! 💪 Fantastic effort!`;
-  else if (totalPercent >= 70) motivationMsg = `${name}, well done! 👏 Getting stronger every day!`;
-  else if (totalPercent >= 60) motivationMsg = `${name}, good effort! 📚 A little more practice and you'll smash it!`;
-  else if (totalPercent >= 50) motivationMsg = `${name}, don't give up! 🌈 You're learning!`;
-  else motivationMsg = `${name}, keep trying! 💪 Every mistake is a step towards success!`;
+  if (totalPercent === 100) motivationMsg = `${userName} you are AMAZING! 🌟 100% - Perfect score!`;
+  else if (totalPercent >= 90) motivationMsg = `${userName} you are BRILLIANT! 🎉 Keep shining!`;
+  else if (totalPercent >= 80) motivationMsg = `${userName} you are GREAT! 💪 Fantastic effort!`;
+  else if (totalPercent >= 70) motivationMsg = `${userName}, well done! 👏 Getting stronger every day!`;
+  else if (totalPercent >= 60) motivationMsg = `${userName}, good effort! 📚 A little more practice and you'll smash it!`;
+  else if (totalPercent >= 50) motivationMsg = `${userName}, don't give up! 🌈 You're learning!`;
+  else motivationMsg = `${userName}, keep trying! 💪 Every mistake is a step towards success!`;
 
   let html = `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Quiz Result</title>
@@ -238,9 +249,9 @@ function renderResultPage(correct, total, topicScores, yearKey, config) {
   html += `</div>`;
 
   if (weakAreas.length) {
-    html += `<div style="background:#fff3cd;border-radius:10px;padding:15px;margin-top:20px;text-align:left;color:#856404;"><h3>${name}, let's improve these topics:</h3><ul style="margin:8px 0 8px 20px;">${weakAreas.map(t => `<li style="margin:4px 0;font-weight:bold;">${t}</li>`).join("")}</ul><p style="font-style:italic;margin-top:8px;">Revise these and try again - you'll see the difference!</p></div>`;
+    html += `<div style="background:#fff3cd;border-radius:10px;padding:15px;margin-top:20px;text-align:left;color:#856404;"><h3>${userName}, let's improve these topics:</h3><ul style="margin:8px 0 8px 20px;">${weakAreas.map(t => `<li style="margin:4px 0;font-weight:bold;">${t}</li>`).join("")}</ul><p style="font-style:italic;margin-top:8px;">Revise these and try again - you'll see the difference!</p></div>`;
   } else {
-    html += `<div style="background:#d4edda;border-radius:10px;padding:15px;margin-top:20px;text-align:center;color:#155724;"><h3>${name}, you smashed every topic! Nothing to improve - you're on fire! 🔥</h3></div>`;
+    html += `<div style="background:#d4edda;border-radius:10px;padding:15px;margin-top:20px;text-align:center;color:#155724;"><h3>${userName}, you smashed every topic! Nothing to improve - you're on fire! 🔥</h3></div>`;
   }
 
   html += `</div><a class="btn" href="${retryLink}">🔄 Try Again</a></div></div></body></html>`;
@@ -267,27 +278,40 @@ function loadingPage(title, subtitle, gradientBg, loadUrl) {
   </body></html>`;
 }
 
-// Year 8 quiz
-app.get("/", (req, res) => {
-  res.send(loadingPage("📚 Daily Revision Quiz", "Year 8 — Aakhya", "linear-gradient(135deg, #667eea 0%, #764ba2 100%)", "/generate?year=year8"));
+// Dynamic quiz route for any user
+app.get("/quiz/:userName", (req, res) => {
+  const userName = req.params.userName;
+  const config = getConfig();
+  if (!config[userName]) {
+    return res.status(404).send(`<h1>User not found</h1><p>${userName} is not configured in the system</p>`);
+  }
+  res.send(loadingPage("📚 Daily Revision Quiz", `${config[userName].year} — ${userName}`, "linear-gradient(135deg, #667eea 0%, #764ba2 100%)", `/generate/${userName}`));
 });
 
-app.get("/generate", async (req, res) => {
-  const yearKey = req.query.year || "year8";
+app.get("/generate/:userName", async (req, res) => {
+  const userName = req.params.userName;
   try {
     const config = getConfig();
-    const results = yearKey === "year8" ? getResults() : getYear3Results();
+    if (!config[userName]) {
+      return res.status(404).send(`<h1>User not found</h1><p>${userName} is not configured</p>`);
+    }
+    const results = getResults(userName);
     const lastScore = results.length ? results[results.length - 1].totalPercent : null;
-    const quiz = await generateQuestionsFromGemini(yearKey);
-    res.send(renderQuizPage(quiz, yearKey, lastScore, config));
+    const quiz = await generateQuestionsFromGemini(userName);
+    res.send(renderQuizPage(quiz, userName, lastScore, config));
   } catch (err) {
-    console.error(`Error generating ${yearKey} quiz:`, err.message);
+    console.error(`Error generating quiz for ${userName}:`, err.message);
     res.status(500).send(`<h1>Error generating quiz</h1><p>${err.message}</p><p>Check your GEMINI_API_KEY environment variable</p>`);
   }
 });
 
-app.post("/submit", (req, res) => {
+app.post("/submit/:userName", (req, res) => {
+  const userName = req.params.userName;
   const config = getConfig();
+  if (!config[userName]) {
+    return res.status(404).send(`<h1>User not found</h1><p>${userName} is not configured</p>`);
+  }
+  
   const total = parseInt(req.body.total);
   let correct = 0;
   const topicScores = {};
@@ -312,50 +336,24 @@ app.post("/submit", (req, res) => {
 
   const totalPercent = Math.round((correct / total) * 100);
   const date = new Date().toISOString().slice(0, 10);
-  saveResult({ date, correct, total, totalPercent, topicScores });
+  saveResult(userName, { date, correct, total, totalPercent, topicScores });
 
-  res.send(renderResultPage(correct, total, topicScores, "year8", config));
+  res.send(renderResultPage(correct, total, topicScores, userName, config));
 });
 
-// Year 3 quiz
+// Backwards compatibility routes
+app.get("/", (req, res) => {
+  res.redirect("/quiz/Aakhya");
+});
+
 app.get("/year3", (req, res) => {
-  res.send(loadingPage("📝 Year 3 Test", "Year 3 — Kahaan", "linear-gradient(135deg, #f093fb 0%, #f5576c 100%)", "/generate?year=year3"));
-});
-
-app.post("/year3/submit", (req, res) => {
-  const config = getConfig();
-  const total = parseInt(req.body.total);
-  let correct = 0;
-  const topicScores = {};
-
-  for (let i = 0; i < total; i++) {
-    const userAns = req.body[`q${i}`];
-    const correctAns = req.body[`a${i}`];
-    const topic = req.body[`t${i}`];
-
-    if (!topicScores[topic]) topicScores[topic] = { correct: 0, total: 0 };
-    topicScores[topic].total++;
-
-    if (userAns === correctAns) {
-      correct++;
-      topicScores[topic].correct++;
-    }
-  }
-
-  for (const t of Object.keys(topicScores)) {
-    topicScores[t].percent = Math.round((topicScores[t].correct / topicScores[t].total) * 100);
-  }
-
-  const totalPercent = Math.round((correct / total) * 100);
-  const date = new Date().toISOString().slice(0, 10);
-  saveYear3Result({ date, correct, total, totalPercent, topicScores });
-
-  res.send(renderResultPage(correct, total, topicScores, "year3", config));
+  res.redirect("/quiz/Kahaan");
 });
 
 // History endpoints
-app.get("/history", (req, res) => res.json(getResults()));
-app.get("/year3/history", (req, res) => res.json(getYear3Results()));
+app.get("/history/:userName", (req, res) => res.json(getResults(req.params.userName)));
+app.get("/history", (req, res) => res.json(getResults("Aakhya")));
+app.get("/year3/history", (req, res) => res.json(getResults("Kahaan")));
 
 // Config endpoint - view/update config
 app.get("/config", (req, res) => {
@@ -370,7 +368,10 @@ app.get("/send-emails", async (req, res) => {
 });
 
 app.listen(PORT, () => {
+  const config = getConfig();
+  const userNames = Object.keys(config);
   console.log(`\n📚 Quiz server running at http://localhost:${PORT}`);
-  console.log(`   Year 8 (${getConfig().year8.name}): http://localhost:${PORT}/`);
-  console.log(`   Year 3 (${getConfig().year3.name}): http://localhost:${PORT}/year3`);
+  userNames.forEach(userName => {
+    console.log(`   ${userName} (${config[userName].year}): http://localhost:${PORT}/quiz/${userName}`);
+  });
 });
