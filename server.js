@@ -160,6 +160,7 @@ function generateFallbackQuestions(userName, totalQuestions) {
   
   // Import the questions bank
   const questionsBank = require('./questions.js');
+  console.log('Available subjects in questions bank:', Object.keys(questionsBank));
   
   const allQuestions = [];
   
@@ -184,10 +185,17 @@ function generateFallbackQuestions(userName, totalQuestions) {
   
   // Collect questions from all subjects/topics
   for (const [subject, topics] of Object.entries(userConfig.subjects)) {
+    console.log(`Processing subject: ${subject}`);
+    if (questionsBank[subject]) {
+      console.log(`Available topics in ${subject}:`, Object.keys(questionsBank[subject]));
+    }
+    
     for (const topic of topics) {
       const mappedTopic = topicMapping[topic] || topic.toLowerCase().replace(/\s+/g, '_');
+      console.log(`Looking for topic: ${topic} -> ${mappedTopic}`);
       
       if (questionsBank[subject] && questionsBank[subject][mappedTopic]) {
+        console.log(`Found ${questionsBank[subject][mappedTopic].length} questions for ${topic}`);
         const topicQuestions = questionsBank[subject][mappedTopic].map(q => ({
           q: q.q,
           options: q.options,
@@ -196,12 +204,16 @@ function generateFallbackQuestions(userName, totalQuestions) {
           topic: topic
         }));
         allQuestions.push(...topicQuestions);
+      } else {
+        console.log(`No questions found for ${subject}/${mappedTopic}`);
       }
     }
   }
   
+  console.log(`Total questions collected: ${allQuestions.length}`);
+  
   if (allQuestions.length === 0) {
-    throw new Error('No fallback questions available');
+    throw new Error(`No fallback questions available. Checked subjects: ${Object.keys(userConfig.subjects).join(', ')}`);
   }
   
   // Shuffle and select questions
