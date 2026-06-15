@@ -158,8 +158,14 @@ function generateFallbackQuestions(userName, totalQuestions) {
   const userConfig = config[userName];
   if (!userConfig) throw new Error(`User ${userName} not found in config`);
   
-  // Import the questions bank
-  const questionsBank = require('./questions.js');
+  // Choose appropriate questions file based on user
+  let questionsBank;
+  if (userName === 'Kahaan') {
+    questionsBank = require('./year3_questions.js');
+  } else {
+    questionsBank = require('./questions.js');
+  }
+  
   console.log('Available subjects in questions bank:', Object.keys(questionsBank));
   
   const allQuestions = [];
@@ -174,13 +180,28 @@ function generateFallbackQuestions(userName, totalQuestions) {
     'Angles': 'angles',
     'Probability': 'probability',
     'Percentages': 'percentages',
+    'Addition': 'addition',
+    'Subtraction': 'subtraction',
+    'Multiplication': 'multiplication',
+    'Division': 'division',
     
     // Science topics
     'Forces': 'forces',
     'Electromagnetism': 'electromagnetism', 
     'Work Done': 'work_done',
     'Periodic Table': 'periodic_table',
-    'Chemical Reactions': 'reactions'
+    'Chemical Reactions': 'reactions',
+    'Plants': 'plants',
+    
+    // English topics
+    'Spelling': 'spelling',
+    'Punctuation': 'punctuation',
+    'Conjunctions': 'conjunctions',
+    'Prepositions': 'prepositions',
+    'Adjectives': 'adjectives',
+    'Adverbs': 'adverbs',
+    'Nouns': 'nouns',
+    'Verbs and Tenses': 'verbs and tenses'
   };
   
   // Collect questions from all subjects/topics
