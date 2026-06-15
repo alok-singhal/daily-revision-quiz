@@ -163,13 +163,35 @@ function generateFallbackQuestions(userName, totalQuestions) {
   
   const allQuestions = [];
   
+  // Topic name mapping from config to questions.js format
+  const topicMapping = {
+    // Math topics
+    'Algebra': 'algebra',
+    'Bearings': 'bearings', 
+    'Compound Shapes': 'compound_shapes',
+    'Circles': 'circles',
+    'Angles': 'angles',
+    'Probability': 'probability',
+    'Percentages': 'percentages',
+    
+    // Science topics
+    'Forces': 'forces',
+    'Electromagnetism': 'electromagnetism', 
+    'Work Done': 'work_done',
+    'Periodic Table': 'periodic_table',
+    'Chemical Reactions': 'reactions'
+  };
+  
   // Collect questions from all subjects/topics
   for (const [subject, topics] of Object.entries(userConfig.subjects)) {
     for (const topic of topics) {
-      const topicKey = topic.toLowerCase().replace(/\s+/g, '_');
-      if (questionsBank[subject] && questionsBank[subject][topicKey]) {
-        const topicQuestions = questionsBank[subject][topicKey].map(q => ({
-          ...q,
+      const mappedTopic = topicMapping[topic] || topic.toLowerCase().replace(/\s+/g, '_');
+      
+      if (questionsBank[subject] && questionsBank[subject][mappedTopic]) {
+        const topicQuestions = questionsBank[subject][mappedTopic].map(q => ({
+          q: q.q,
+          options: q.options,
+          answer: q.answer,
           subject: subject,
           topic: topic
         }));
