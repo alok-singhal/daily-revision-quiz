@@ -452,6 +452,19 @@ app.post("/submit/:userName", (req, res) => {
   const date = new Date().toISOString().slice(0, 10);
   saveResult(userName, { date, correct, total, totalPercent, topicScores });
 
+  // Send result email to parent
+  const userConfig = config[userName];
+  if (userConfig.parentEmail) {
+    const weakTopics = Object.entries(topicScores).filter(([, d]) => d.percent < 60).map(([t]) => t.replace("_", " → "));
+    let body = `📊 Quiz Result for ${userName} (${userConfig.year})\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nDate: ${date}\nScore: ${correct}/${total} (${totalPercent}%)\n\nTopic Breakdown:\n`;
+    for (const [topic, data] of Object.entries(topicScores)) {
+      body += `  ${topic.replace("_", " → ")}: ${data.correct}/${data.total} (${data.percent}%)\n`;
+    }
+    if (weakTopics.length) body += `\n⚠️ Needs improvement: ${weakTopics.join(", ")}`;
+    else body += `\n🌟 All topics passed!`;
+    sendEmail(userConfig.parentEmail, `📊 ${userName} scored ${totalPercent}% - Daily Practise Test`, body);
+  }
+
   res.send(renderResultPage(correct, total, topicScores, userName, config));
 });
 
