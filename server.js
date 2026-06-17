@@ -368,7 +368,7 @@ function renderResultPage(correct, total, topicScores, userName, config) {
     html += `<div style="background:#d4edda;border-radius:10px;padding:15px;margin-top:20px;text-align:center;color:#155724;"><h3>${userName}, you smashed every topic! Nothing to improve - you're on fire! 🔥</h3></div>`;
   }
 
-  html += `</div><a class="btn" href="${retryLink}">🔄 Try Again</a></div></div></body></html>`;
+  html += `</div><p style="margin-top:20px;color:#555;font-style:italic;">🚀 Come back tomorrow for fresh new questions!</p></div></div></body></html>`;
   return html;
 }
 
@@ -392,12 +392,46 @@ function loadingPage(title, subtitle, gradientBg, loadUrl) {
   </body></html>`;
 }
 
+// Check if user already submitted today
+function hasSubmittedToday(userName) {
+  const results = getResults(userName);
+  if (!results.length) return false;
+  const today = new Date().toISOString().slice(0, 10);
+  return results[results.length - 1].date === today;
+}
+
+function renderAlreadyDonePage(userName, config) {
+  const userConfig = config[userName];
+  const lastResult = getResults(userName).slice(-1)[0];
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Quiz Complete</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Segoe UI', sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px; }
+    .card { background: white; border-radius: 16px; padding: 40px; max-width: 500px; text-align: center; box-shadow: 0 8px 30px rgba(0,0,0,0.15); }
+    .emoji { font-size: 4em; margin-bottom: 15px; }
+    h1 { color: #333; margin-bottom: 10px; }
+    p { color: #555; font-size: 1.1em; margin: 10px 0; }
+    .score { font-size: 1.3em; font-weight: bold; color: #667eea; margin: 15px 0; }
+  </style></head><body>
+  <div class="card">
+    <div class="emoji">✅</div>
+    <h1>Great job, ${userName}!</h1>
+    <p>You've already completed today's quiz.</p>
+    <div class="score">Today's score: ${lastResult.totalPercent}%</div>
+    <p>🚀 Come back tomorrow for fresh new questions!</p>
+  </div></body></html>`;
+}
+
 // Dynamic quiz route for any user
 app.get("/quiz/:userName", (req, res) => {
   const userName = req.params.userName;
   const config = getConfig();
   if (!config[userName]) {
     return res.status(404).send(`<h1>User not found</h1><p>${userName} is not configured in the system</p>`);
+  }
+  if (hasSubmittedToday(userName)) {
+    return res.send(renderAlreadyDonePage(userName, config));
   }
   res.send(loadingPage("📚 Daily Revision Quiz", `${config[userName].year} — ${userName}`, "linear-gradient(135deg, #667eea 0%, #764ba2 100%)", `/generate/${userName}`));
 });
@@ -408,6 +442,9 @@ app.get("/generate/:userName", async (req, res) => {
     const config = getConfig();
     if (!config[userName]) {
       return res.status(404).send(`<h1>User not found</h1><p>${userName} is not configured</p>`);
+    }
+    if (hasSubmittedToday(userName)) {
+      return res.send(renderAlreadyDonePage(userName, config));
     }
     const results = getResults(userName);
     const lastScore = results.length ? results[results.length - 1].totalPercent : null;
