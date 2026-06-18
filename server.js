@@ -52,13 +52,19 @@ async function sendDailyEmails() {
   const today = new Date().toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" });
   const config = getConfig();
   
+  console.log(`📧 Starting to send daily emails for ${today}`);
+  
   // Send personalized email to each user
   for (const [userName, userConfig] of Object.entries(config)) {
+    console.log(`Sending email to ${userName} at ${userConfig.email}`);
     const quizUrl = `${QUIZ_URL}/quiz/${userName}`;
     const body = `\n📚 DAILY REVISION - ${today}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🎯 Hi ${userName}!\n\nYour daily quiz is ready: ${quizUrl}\n(${userConfig.questionsPerQuiz} MCQs - AI Generated!)\n\n💡 Fresh questions every day!\nGood luck! 🚀\n`;
     
-    await sendEmail(userConfig.email, `📚 Daily Revision - ${today}`, body);
+    const success = await sendEmail(userConfig.email, `📚 Daily Revision - ${today}`, body);
+    console.log(`Email to ${userName}: ${success ? 'SUCCESS' : 'FAILED'}`);
   }
+  
+  console.log('📧 Daily email sending completed');
 }
 
 
@@ -529,6 +535,29 @@ app.get("/config", (req, res) => {
 app.get("/send-emails", async (req, res) => {
   await sendDailyEmails();
   res.send("✅ Emails sent!");
+});
+
+// Email diagnostic endpoint
+app.get("/test-email", async (req, res) => {
+  const auth = getGmailAuth();
+  if (!auth) {
+    return res.json({ status: "error", message: "Gmail credentials not configured" });
+  }
+  
+  try {
+    const gmail = google.gmail({ version: "v1", auth });
+    const profile = await gmail.users.getProfile({ userId: "me" });
+    res.json({ 
+      status: "success", 
+      message: "Gmail authentication successful",
+      emailAddress: profile.data.emailAddress 
+    });
+  } catch (err) {
+    res.json({ 
+      status: "error", 
+      message: `Gmail authentication failed: ${err.message}` 
+    });
+  }
 });
 
 app.listen(PORT, () => {
