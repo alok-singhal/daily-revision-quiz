@@ -3,11 +3,17 @@ name: Daily Quiz Email
 on:
   schedule:
     - cron: '0 10 * * *'  # 10:00 UTC = 11:00 AM BST
-  workflow_dispatch:  # allows manual trigger from GitHub UI if needed
+  workflow_dispatch:
 
 jobs:
   send-email:
     runs-on: ubuntu-latest
     steps:
+      - name: Wake up Render service
+        run: curl -s --max-time 30 https://daily-revision-quiz.onrender.com/ || true
+
+      - name: Wait for service to be ready
+        run: sleep 15
+
       - name: Trigger daily email
-        run: curl -s https://daily-revision-quiz.onrender.com/send-emails
+        run: curl -s --max-time 60 https://daily-revision-quiz.onrender.com/send-emails
