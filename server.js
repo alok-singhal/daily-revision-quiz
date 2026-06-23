@@ -2,6 +2,7 @@ const express = require("express");
 const fs = require("fs");
 const path = require("path");
 const { google } = require("googleapis");
+const { MongoClient } = require("mongodb");
 
 const app = express();
 app.use(express.json());
@@ -11,6 +12,20 @@ const CONFIG_PATH = path.join(__dirname, "config.json");
 const RESULTS_PATH = path.join(__dirname, "results.json");
 const YEAR3_RESULTS_PATH = path.join(__dirname, "year3_results.json");
 const PORT = process.env.PORT || 3000;
+
+// ============== MONGODB ==============
+let db;
+async function connectDB() {
+  if (!process.env.MONGODB_URI) {
+    console.log("⚠️ No MONGODB_URI set, using local config.json as fallback");
+    return;
+  }
+  const client = new MongoClient(process.env.MONGODB_URI);
+  await client.connect();
+  db = client.db("practisetest");
+  await db.collection("users").createIndex({ name: 1 }, { unique: true });
+  console.log("✅ Connected to MongoDB");
+}
 
 // ============== EMAIL CONFIG ==============
 const QUIZ_URL = "https://daily-revision-quiz.onrender.com";
@@ -77,7 +92,7 @@ async function sendEmail(toEmail, subject, body) {
 
 async function sendDailyEmails() {
   const today = new Date().toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" });
-  const config = getConfig();
+  const config = await getConfig();
   
   console.log(`📧 Starting to send daily emails for ${today}`);
   
@@ -96,13 +111,28 @@ async function sendDailyEmails() {
 
 
 
-function getConfig() {
+async function getConfig() {
+  if (db) {
+    const users = await db.collection("users").find({ active: true }).toArray();
+    const config = {};
+    for (const user of users) {
+      config[user.name] = {
+        email: user.email,
+        parentEmail: user.parentEmail,
+        year: user.year,
+        questionsPerQuiz: user.questionsPerQuiz,
+        frequency: user.frequency,
+        subjects: user.subjects
+      };
+    }
+    return config;
+  }
   return JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
 }
 
 // Generate questions from Gemini REST API based on config topics
 async function generateQuestionsFromGemini(userName) {
-  const config = getConfig();
+  const config = await getConfig();
   const userConfig = config[userName];
   if (!userConfig) throw new Error(`User ${userName} not found in config`);
   
@@ -110,7 +140,7 @@ async function generateQuestionsFromGemini(userName) {
   
   // First try to use pre-generated questions as fallback
   try {
-    const fallbackQuestions = generateFallbackQuestions(userName, totalQuestions);
+    const fallbackQuestions = await generateFallbackQuestions(userName, totalQuestions);
     if (fallbackQuestions && fallbackQuestions.length >= totalQuestions) {
       console.log(`Using fallback questions for ${userName}`);
       return fallbackQuestions.slice(0, totalQuestions);
@@ -162,7 +192,7 @@ Make questions age-appropriate for ${userConfig.year}. Mix easy and medium diffi
 
       if (!resp.ok) {
         console.log(`Gemini API failed: ${resp.status}, falling back to pre-generated questions`);
-        return generateFallbackQuestions(userName, totalQuestions);
+        return await generateFallbackQuestions(userName, totalQuestions);
       }
 
       const data = await resp.json();
@@ -171,14 +201,14 @@ Make questions age-appropriate for ${userConfig.year}. Mix easy and medium diffi
       const jsonMatch = text.match(/\[[\s\S]*\]/);
       if (!jsonMatch) {
         console.log('Failed to parse Gemini response, using fallback');
-        return generateFallbackQuestions(userName, totalQuestions);
+        return await generateFallbackQuestions(userName, totalQuestions);
       }
 
       return JSON.parse(jsonMatch[0]).slice(0, totalQuestions);
     } catch (err) {
       if (attempt === 3) {
         console.log(`All Gemini attempts failed, using fallback questions: ${err.message}`);
-        return generateFallbackQuestions(userName, totalQuestions);
+        return await generateFallbackQuestions(userName, totalQuestions);
       }
       console.log(`⚠️ Attempt ${attempt} failed: ${err.message}`);
     }
@@ -186,8 +216,8 @@ Make questions age-appropriate for ${userConfig.year}. Mix easy and medium diffi
 }
 
 // Fallback function to generate questions from pre-existing question bank
-function generateFallbackQuestions(userName, totalQuestions) {
-  const config = getConfig();
+async function generateFallbackQuestions(userName, totalQuestions) {
+  const config = await getConfig();
   const userConfig = config[userName];
   if (!userConfig) throw new Error(`User ${userName} not found in config`);
   
@@ -476,9 +506,9 @@ function renderAlreadyDonePage(userName, config) {
 }
 
 // Dynamic quiz route for any user
-app.get("/quiz/:userName", (req, res) => {
+app.get("/quiz/:userName", async (req, res) => {
   const userName = req.params.userName;
-  const config = getConfig();
+  const config = await getConfig();
   if (!config[userName]) {
     return res.status(404).send(`<h1>User not found</h1><p>${userName} is not configured in the system</p>`);
   }
@@ -491,7 +521,7 @@ app.get("/quiz/:userName", (req, res) => {
 app.get("/generate/:userName", async (req, res) => {
   const userName = req.params.userName;
   try {
-    const config = getConfig();
+    const config = await getConfig();
     if (!config[userName]) {
       return res.status(404).send(`<h1>User not found</h1><p>${userName} is not configured</p>`);
     }
@@ -508,9 +538,9 @@ app.get("/generate/:userName", async (req, res) => {
   }
 });
 
-app.post("/submit/:userName", (req, res) => {
+app.post("/submit/:userName", async (req, res) => {
   const userName = req.params.userName;
-  const config = getConfig();
+  const config = await getConfig();
   if (!config[userName]) {
     return res.status(404).send(`<h1>User not found</h1><p>${userName} is not configured</p>`);
   }
@@ -712,7 +742,7 @@ app.get("/register", (req, res) => {
   res.send(html);
 });
 
-app.post("/register", (req, res) => {
+app.post("/register", async (req, res) => {
   const { name, year, kidEmail, parentEmail, questionsPerQuiz, topics, frequency } = req.body;
 
   if (!name || !year || !kidEmail || !parentEmail) {
@@ -732,17 +762,26 @@ app.post("/register", (req, res) => {
     return res.status(400).send("<h1>No topics selected</h1><p>Please select at least one topic.</p><a href='/register'>Go back</a>");
   }
 
-  // Save to config
-  const config = getConfig();
-  config[name] = {
+  // Save to MongoDB (or fallback to config.json)
+  const userDoc = {
+    name,
     email: kidEmail,
-    parentEmail: parentEmail,
-    year: year,
-    questionsPerQuiz: parseInt(questionsPerQuiz) || 20,
+    parentEmail,
+    year,
+    questionsPerQuiz: Math.min(40, Math.max(5, parseInt(questionsPerQuiz) || 20)),
     frequency: parseInt(frequency) || 5,
-    subjects: subjects
+    subjects,
+    active: true,
+    createdAt: new Date()
   };
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
+
+  if (db) {
+    await db.collection("users").updateOne({ name }, { $set: userDoc }, { upsert: true });
+  } else {
+    const config = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
+    config[name] = { email: kidEmail, parentEmail, year, questionsPerQuiz: userDoc.questionsPerQuiz, frequency: userDoc.frequency, subjects };
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
+  }
 
   // Success page
   res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -790,9 +829,9 @@ app.get("/history", (req, res) => res.json(getResults("Aakhya")));
 app.get("/year3/history", (req, res) => res.json(getResults("Kahaan")));
 
 // Config endpoint - view/update config
-app.get("/config", (req, res) => {
-  const config = getConfig();
-  res.json({ year8: { ...config.year8 }, year3: { ...config.year3 } });
+app.get("/config", async (req, res) => {
+  const config = await getConfig();
+  res.json(config);
 });
 
 // Manual email trigger
@@ -824,11 +863,13 @@ app.get("/test-email", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  const config = getConfig();
-  const userNames = Object.keys(config);
-  console.log(`\n📚 Quiz server running at http://localhost:${PORT}`);
-  userNames.forEach(userName => {
-    console.log(`   ${userName} (${config[userName].year}): http://localhost:${PORT}/quiz/${userName}`);
+connectDB().then(async () => {
+  app.listen(PORT, async () => {
+    const config = await getConfig();
+    const userNames = Object.keys(config);
+    console.log(`\n📚 Quiz server running at http://localhost:${PORT}`);
+    userNames.forEach(userName => {
+      console.log(`   ${userName} (${config[userName].year}): http://localhost:${PORT}/quiz/${userName}`);
+    });
   });
 });
