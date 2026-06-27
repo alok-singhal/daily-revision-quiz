@@ -1,6 +1,4 @@
 const express = require("express");
-const fs = require("fs");
-const path = require("path");
 const { google } = require("googleapis");
 const { MongoClient } = require("mongodb");
 
@@ -8,16 +6,14 @@ const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-const CONFIG_PATH = path.join(__dirname, "config.json");
-const RESULTS_PATH = path.join(__dirname, "results.json");
-const YEAR3_RESULTS_PATH = path.join(__dirname, "year3_results.json");
+
 const PORT = process.env.PORT || 3000;
 
 // ============== MONGODB ==============
 let db;
 async function connectDB() {
   if (!process.env.MONGODB_URI) {
-    console.log("⚠️ No MONGODB_URI set, using local config.json as fallback");
+    console.log("❌ No MONGODB_URI set - database required");
     return;
   }
   const client = new MongoClient(process.env.MONGODB_URI);
@@ -28,7 +24,7 @@ async function connectDB() {
 }
 
 // ============== EMAIL CONFIG ==============
-const QUIZ_URL = "https://daily-revision-quiz.onrender.com";
+const QUIZ_URL = "https://edusphere-central.swatigarg654.repl.co";
 
 function getGmailAuth() {
   const credentials = JSON.parse(process.env.GMAIL_CREDENTIALS || "{}");
@@ -112,69 +108,83 @@ async function sendDailyEmails() {
 
 
 async function getConfig() {
-  if (db) {
-    const users = await db.collection("users").find({ active: true }).toArray();
-    const config = {};
-    for (const user of users) {
-      config[user.name] = {
-        email: user.email,
-        parentEmail: user.parentEmail,
-        year: user.year,
-        questionsPerQuiz: user.questionsPerQuiz,
-        frequency: user.frequency,
-        subjects: user.subjects
-      };
-    }
-    return config;
+  if (!db) throw new Error('Database not connected');
+  const users = await db.collection("users").find({ active: true }).toArray();
+  const config = {};
+  for (const user of users) {
+    config[user.name] = {
+      email: user.email,
+      parentEmail: user.parentEmail,
+      year: user.year,
+      questionsPerQuiz: user.questionsPerQuiz || 25,
+      frequency: user.frequency,
+      subjects: user.subjects
+    };
   }
-  return JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
+  return config;
 }
 
-// Generate questions from Gemini REST API based on config topics
-async function generateQuestionsFromGemini(userName) {
+// Generate questions - maths from generator, other subjects from Gemini
+const { generateQuestions: generateMathsQuestions } = require('./maths_generator.js');
+
+async function generateQuiz(userName) {
   const config = await getConfig();
   const userConfig = config[userName];
-  if (!userConfig) throw new Error(`User ${userName} not found in config`);
-  
-  const totalQuestions = userConfig.questionsPerQuiz;
-  
-  // First try to use pre-generated questions as fallback
-  try {
-    const fallbackQuestions = await generateFallbackQuestions(userName, totalQuestions);
-    if (fallbackQuestions && fallbackQuestions.length >= totalQuestions) {
-      console.log(`Using fallback questions for ${userName}`);
-      return fallbackQuestions.slice(0, totalQuestions);
+  if (!userConfig) throw new Error(`User ${userName} not found`);
+
+  const totalQuestions = userConfig.questionsPerQuiz || 25;
+  const subjects = Object.keys(userConfig.subjects);
+  const questionsPerSubject = Math.ceil(totalQuestions / subjects.length);
+  const allQuestions = [];
+
+  // Get year number for maths generator
+  const yearNum = parseInt(userConfig.year.replace('Year ', ''));
+
+  for (const subject of subjects) {
+    if (subject === 'maths') {
+      // Use maths generator - 100% correct answers
+      const mathsQs = generateMathsQuestions(yearNum, questionsPerSubject);
+      allQuestions.push(...mathsQs.map(q => ({
+        q: q.q,
+        options: q.options,
+        answer: q.answer,
+        topic: q.topic.replace('maths_', ''),
+        subject: 'maths'
+      })));
+    } else {
+      // Use Gemini for science, english, history
+      const geminiQs = await generateFromGemini(subject, userConfig.subjects[subject], questionsPerSubject, userConfig.year);
+      allQuestions.push(...geminiQs);
     }
-  } catch (err) {
-    console.log('Fallback questions failed, trying Gemini...');
   }
-  
+
+  // Shuffle and trim to exact count
+  return allQuestions.sort(() => 0.5 - Math.random()).slice(0, totalQuestions);
+}
+
+async function generateFromGemini(subject, topics, count, year) {
   const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    throw new Error('GEMINI_API_KEY not found, using fallback questions');
-  }
+  if (!apiKey) throw new Error('GEMINI_API_KEY not set');
 
-  const topicsList = Object.entries(userConfig.subjects)
-    .map(([subject, topics]) => `${subject}: ${topics.join(", ")}`)
-    .join("\n");
+  const topicsList = topics && topics.length > 0
+    ? topics.join(', ')
+    : `pick age-appropriate ${subject} topics for ${year}`;
 
-  const prompt = `Generate exactly ${totalQuestions} multiple choice questions for a ${userConfig.year} student.
+  const prompt = `Generate exactly ${count} multiple choice questions for a UK ${year} student.
+Subject: ${subject}
+Topics: ${topicsList}
 
-Topics to cover (spread questions evenly across all topics):
-${topicsList}
+Return ONLY a valid JSON array. Each object must have:
+- "q": question text
+- "options": array of exactly 4 strings
+- "answer": index (0-3) of correct option
+- "topic": topic name
+- "subject": "${subject}"
 
-Return ONLY a valid JSON array with no extra text. Each object must have:
-- "q": the question text
-- "options": array of exactly 4 option strings
-- "answer": index (0-3) of the correct option
-- "topic": the topic name (e.g. "Algebra", "Forces")
-- "subject": the subject name (e.g. "maths", "science")
-
-Make questions age-appropriate for ${userConfig.year}. Mix easy and medium difficulty. No duplicate questions.`;
+Age-appropriate, mix easy and medium difficulty. No duplicates.`;
 
   const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=${apiKey}`;
-  
-  // Retry logic for quota exceeded errors
+
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       const resp = await fetch(url, {
@@ -184,138 +194,35 @@ Make questions age-appropriate for ${userConfig.year}. Mix easy and medium diffi
       });
 
       if (resp.status === 429) {
-        const retryAfter = Math.pow(2, attempt) * 1000;
-        console.log(`⏳ Quota exceeded, retrying in ${retryAfter}ms (attempt ${attempt}/3)`);
-        await new Promise(resolve => setTimeout(resolve, retryAfter));
+        await new Promise(r => setTimeout(r, Math.pow(2, attempt) * 1000));
         continue;
       }
-
-      if (!resp.ok) {
-        console.log(`Gemini API failed: ${resp.status}, falling back to pre-generated questions`);
-        return await generateFallbackQuestions(userName, totalQuestions);
-      }
+      if (!resp.ok) throw new Error(`Gemini API error: ${resp.status}`);
 
       const data = await resp.json();
       const text = data.candidates[0].content.parts[0].text;
-
       const jsonMatch = text.match(/\[[\s\S]*\]/);
-      if (!jsonMatch) {
-        console.log('Failed to parse Gemini response, using fallback');
-        return await generateFallbackQuestions(userName, totalQuestions);
-      }
+      if (!jsonMatch) throw new Error('Failed to parse Gemini response');
 
-      return JSON.parse(jsonMatch[0]).slice(0, totalQuestions);
+      return JSON.parse(jsonMatch[0]).slice(0, count);
     } catch (err) {
       if (attempt === 3) {
-        console.log(`All Gemini attempts failed, using fallback questions: ${err.message}`);
-        return await generateFallbackQuestions(userName, totalQuestions);
-      }
-      console.log(`⚠️ Attempt ${attempt} failed: ${err.message}`);
-    }
-  }
-}
-
-// Fallback function to generate questions from pre-existing question bank
-async function generateFallbackQuestions(userName, totalQuestions) {
-  const config = await getConfig();
-  const userConfig = config[userName];
-  if (!userConfig) throw new Error(`User ${userName} not found in config`);
-  
-  // Choose appropriate questions file based on user
-  let questionsBank;
-  if (userName === 'Kahaan') {
-    questionsBank = require('./year3_questions.js');
-  } else {
-    questionsBank = require('./questions.js');
-  }
-  
-  console.log('Available subjects in questions bank:', Object.keys(questionsBank));
-  
-  const allQuestions = [];
-  
-  // Topic name mapping from config to questions.js format
-  const topicMapping = {
-    // Math topics
-    'Algebra': 'algebra',
-    'Bearings': 'bearings', 
-    'Compound Shapes': 'compound_shapes',
-    'Circles': 'circles',
-    'Angles': 'angles',
-    'Probability': 'probability',
-    'Percentages': 'percentages',
-    'Addition': 'addition',
-    'Subtraction': 'subtraction',
-    'Multiplication': 'multiplication',
-    'Division': 'division',
-    
-    // Science topics
-    'Forces': 'forces',
-    'Electromagnetism': 'electromagnetism', 
-    'Work Done': 'work_done',
-    'Periodic Table': 'periodic_table',
-    'Chemical Reactions': 'reactions',
-    'Plants': 'plants',
-    
-    // English topics
-    'Spelling': 'spelling',
-    'Punctuation': 'punctuation',
-    'Conjunctions': 'conjunctions',
-    'Prepositions': 'prepositions',
-    'Adjectives': 'adjectives',
-    'Adverbs': 'adverbs',
-    'Nouns': 'nouns',
-    'Verbs and Tenses': 'verbs and tenses'
-  };
-  
-  // Collect questions from all subjects/topics
-  for (const [subject, topics] of Object.entries(userConfig.subjects)) {
-    console.log(`Processing subject: ${subject}`);
-    if (questionsBank[subject]) {
-      console.log(`Available topics in ${subject}:`, Object.keys(questionsBank[subject]));
-    }
-    
-    for (const topic of topics) {
-      const mappedTopic = topicMapping[topic] || topic.toLowerCase().replace(/\s+/g, '_');
-      console.log(`Looking for topic: ${topic} -> ${mappedTopic}`);
-      
-      if (questionsBank[subject] && questionsBank[subject][mappedTopic]) {
-        console.log(`Found ${questionsBank[subject][mappedTopic].length} questions for ${topic}`);
-        const topicQuestions = questionsBank[subject][mappedTopic].map(q => ({
-          q: q.q,
-          options: q.options,
-          answer: q.answer,
-          subject: subject,
-          topic: topic
-        }));
-        allQuestions.push(...topicQuestions);
-      } else {
-        console.log(`No questions found for ${subject}/${mappedTopic}`);
+        console.error(`Gemini failed for ${subject}: ${err.message}`);
+        return [];
       }
     }
   }
-  
-  console.log(`Total questions collected: ${allQuestions.length}`);
-  
-  if (allQuestions.length === 0) {
-    throw new Error(`No fallback questions available. Checked subjects: ${Object.keys(userConfig.subjects).join(', ')}`);
-  }
-  
-  // Shuffle and select questions
-  const shuffled = allQuestions.sort(() => 0.5 - Math.random());
-  return shuffled.slice(0, totalQuestions);
+  return [];
 }
 
 // ---- Results helpers ----
-function getResults(userName) {
-  const resultsPath = path.join(__dirname, `${userName}_results.json`);
-  if (fs.existsSync(resultsPath)) return JSON.parse(fs.readFileSync(resultsPath, "utf-8"));
-  return [];
+async function getResults(userName) {
+  if (!db) return [];
+  return await db.collection("results").find({ userName }).sort({ date: -1 }).toArray();
 }
-function saveResult(userName, result) {
-  const resultsPath = path.join(__dirname, `${userName}_results.json`);
-  const results = getResults(userName);
-  results.push(result);
-  fs.writeFileSync(resultsPath, JSON.stringify(results, null, 2));
+async function saveResult(userName, result) {
+  if (!db) return;
+  await db.collection("results").insertOne({ userName, ...result });
 }
 
 // ---- Quiz HTML renderer ----
@@ -475,16 +382,17 @@ function loadingPage(title, subtitle, gradientBg, loadUrl) {
 }
 
 // Check if user already submitted today
-function hasSubmittedToday(userName) {
-  const results = getResults(userName);
-  if (!results.length) return false;
+async function hasSubmittedToday(userName) {
+  if (!db) return false;
   const today = new Date().toISOString().slice(0, 10);
-  return results[results.length - 1].date === today;
+  const found = await db.collection("results").findOne({ userName, date: today });
+  return !!found;
 }
 
-function renderAlreadyDonePage(userName, config) {
+async function renderAlreadyDonePage(userName, config) {
   const userConfig = config[userName];
-  const lastResult = getResults(userName).slice(-1)[0];
+  const results = await getResults(userName);
+  const lastResult = results[0];
   return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Quiz Complete</title>
   <style>
@@ -512,8 +420,8 @@ app.get("/quiz/:userName", async (req, res) => {
   if (!config[userName]) {
     return res.status(404).send(`<h1>User not found</h1><p>${userName} is not configured in the system</p>`);
   }
-  if (hasSubmittedToday(userName)) {
-    return res.send(renderAlreadyDonePage(userName, config));
+  if (await hasSubmittedToday(userName)) {
+    return res.send(await renderAlreadyDonePage(userName, config));
   }
   res.send(loadingPage("📚 Daily Revision Quiz", `${config[userName].year} — ${userName}`, "linear-gradient(135deg, #667eea 0%, #764ba2 100%)", `/generate/${userName}`));
 });
@@ -525,12 +433,12 @@ app.get("/generate/:userName", async (req, res) => {
     if (!config[userName]) {
       return res.status(404).send(`<h1>User not found</h1><p>${userName} is not configured</p>`);
     }
-    if (hasSubmittedToday(userName)) {
-      return res.send(renderAlreadyDonePage(userName, config));
+    if (await hasSubmittedToday(userName)) {
+      return res.send(await renderAlreadyDonePage(userName, config));
     }
-    const results = getResults(userName);
-    const lastScore = results.length ? results[results.length - 1].totalPercent : null;
-    const quiz = await generateQuestionsFromGemini(userName);
+    const results = await getResults(userName);
+    const lastScore = results.length ? results[0].totalPercent : null;
+    const quiz = await generateQuiz(userName);
     res.send(renderQuizPage(quiz, userName, lastScore, config));
   } catch (err) {
     console.error(`Error generating quiz for ${userName}:`, err.message);
@@ -569,7 +477,7 @@ app.post("/submit/:userName", async (req, res) => {
 
   const totalPercent = Math.round((correct / total) * 100);
   const date = new Date().toISOString().slice(0, 10);
-  saveResult(userName, { date, correct, total, totalPercent, topicScores });
+  await saveResult(userName, { date, correct, total, totalPercent, topicScores });
 
   // Send result email to parent
   const userConfig = config[userName];
@@ -589,71 +497,71 @@ app.post("/submit/:userName", async (req, res) => {
 
 // ============== REGISTER PAGE ==============
 app.get("/register", (req, res) => {
-  let html = `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>QuizBot - Daily Revision for Kids</title>
+  res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>QuizBot - Register</title>
   <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&display=swap" rel="stylesheet">
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: 'Poppins', sans-serif; background: #0f0c29; min-height: 100vh; padding: 20px; position: relative; overflow-x: hidden; }
-    body::before { content: ''; position: fixed; top: -50%; left: -50%; width: 200%; height: 200%; background: radial-gradient(circle at 30% 50%, rgba(102, 126, 234, 0.15) 0%, transparent 50%), radial-gradient(circle at 70% 80%, rgba(118, 75, 162, 0.1) 0%, transparent 50%); animation: bgFloat 20s ease-in-out infinite; z-index: 0; }
-    @keyframes bgFloat { 0%, 100% { transform: translate(0, 0); } 50% { transform: translate(-2%, -2%); } }
+    body::before { content: ''; position: fixed; top: -50%; left: -50%; width: 200%; height: 200%; background: radial-gradient(circle at 30% 50%, rgba(102, 126, 234, 0.15) 0%, transparent 50%), radial-gradient(circle at 70% 80%, rgba(118, 75, 162, 0.1) 0%, transparent 50%); z-index: 0; }
     .container { max-width: 650px; margin: 0 auto; position: relative; z-index: 1; }
     .header { text-align: center; color: white; margin-bottom: 35px; padding-top: 20px; }
-    .header .logo { font-size: 3.5em; margin-bottom: 10px; animation: bounce 2s ease-in-out infinite; }
-    @keyframes bounce { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-8px); } }
+    .header .logo { font-size: 3.5em; margin-bottom: 10px; }
     .header h1 { font-size: 2.2em; font-weight: 700; margin-bottom: 8px; background: linear-gradient(135deg, #667eea, #764ba2, #f093fb); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
     .header p { opacity: 0.8; font-size: 1.05em; color: #b8c5e8; }
-    .features { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; margin-bottom: 30px; }
-    .feature { background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); border-radius: 12px; padding: 15px 10px; text-align: center; color: white; }
-    .feature .icon { font-size: 1.8em; margin-bottom: 5px; }
-    .feature .text { font-size: 0.75em; color: #b8c5e8; }
-    .card { background: rgba(255,255,255,0.97); border-radius: 20px; padding: 35px; box-shadow: 0 20px 60px rgba(0,0,0,0.3), 0 0 0 1px rgba(255,255,255,0.1); backdrop-filter: blur(10px); }
-    .field { margin-bottom: 22px; }
-    .field > label { display: block; font-weight: 600; color: #1a1a2e; margin-bottom: 8px; font-size: 0.9em; letter-spacing: 0.3px; }
-    .field input[type="text"], .field input[type="email"], .field input[type="number"], .field select { width: 100%; padding: 14px 16px; border: 2px solid #e8ecf4; border-radius: 12px; font-size: 1em; font-family: 'Poppins', sans-serif; transition: all 0.3s; background: #f8fafc; }
-    .field input:focus, .field select:focus { border-color: #667eea; outline: none; background: white; box-shadow: 0 0 0 4px rgba(102, 126, 234, 0.1); }
-    .field input::placeholder { color: #a0aec0; }
-    .topics-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-    .topics-grid label { display: flex; align-items: center; gap: 10px; padding: 11px 14px; border: 2px solid #e8ecf4; border-radius: 10px; cursor: pointer; font-size: 0.88em; transition: all 0.2s; font-weight: 500; }
-    .topics-grid label:hover { border-color: #667eea; background: #f0f0ff; transform: translateY(-1px); }
-    .topics-grid input[type="checkbox"] { width: 18px; height: 18px; accent-color: #667eea; }
-    .subject-header { font-weight: 700; color: #667eea; margin: 18px 0 10px; font-size: 0.95em; display: flex; align-items: center; gap: 6px; }
-    .btn { display: block; width: 100%; padding: 18px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; border: none; border-radius: 14px; font-size: 1.15em; font-weight: 600; cursor: pointer; margin-top: 28px; font-family: 'Poppins', sans-serif; transition: all 0.3s; box-shadow: 0 8px 25px rgba(102, 126, 234, 0.35); }
-    .btn:hover { transform: translateY(-2px); box-shadow: 0 12px 35px rgba(102, 126, 234, 0.5); }
-    .btn:active { transform: translateY(0); }
-    .note { background: linear-gradient(135deg, #f0f4ff, #e8ecff); border-radius: 12px; padding: 16px; margin-top: 20px; color: #4a5568; font-size: 0.85em; border: 1px solid #e2e8f0; line-height: 1.5; }
-    .frequency-options { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-    .freq-option { display: flex; align-items: center; gap: 10px; padding: 12px 14px; border: 2px solid #e8ecf4; border-radius: 10px; cursor: pointer; transition: all 0.2s; font-size: 0.88em; font-weight: 500; }
-    .freq-option:hover { border-color: #667eea; background: #f0f0ff; }
-    .freq-option input[type="radio"] { width: 18px; height: 18px; accent-color: #667eea; }
+    .card { background: rgba(255,255,255,0.97); border-radius: 20px; padding: 35px; box-shadow: 0 20px 60px rgba(0,0,0,0.3); }
+    .section-title { font-weight: 700; color: #667eea; font-size: 1em; margin-bottom: 15px; display: flex; align-items: center; gap: 8px; }
+    .field { margin-bottom: 18px; }
+    .field > label { display: block; font-weight: 600; color: #1a1a2e; margin-bottom: 6px; font-size: 0.85em; }
+    .field input[type="text"], .field input[type="email"], .field input[type="tel"], .field select, .field textarea { width: 100%; padding: 12px 14px; border: 2px solid #e8ecf4; border-radius: 10px; font-size: 0.95em; font-family: 'Poppins', sans-serif; transition: all 0.3s; background: #f8fafc; }
+    .field input:focus, .field select:focus, .field textarea:focus { border-color: #667eea; outline: none; background: white; box-shadow: 0 0 0 4px rgba(102, 126, 234, 0.1); }
+    .field textarea { resize: vertical; min-height: 70px; }
+    .radio-group { display: flex; gap: 15px; flex-wrap: wrap; }
+    .radio-option { display: flex; align-items: center; gap: 8px; padding: 10px 14px; border: 2px solid #e8ecf4; border-radius: 10px; cursor: pointer; font-size: 0.88em; font-weight: 500; transition: all 0.2s; }
+    .radio-option:hover { border-color: #667eea; background: #f0f0ff; }
+    .radio-option input[type="radio"] { accent-color: #667eea; }
+    .checkbox-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .checkbox-option { display: flex; align-items: center; gap: 10px; padding: 12px 14px; border: 2px solid #e8ecf4; border-radius: 10px; cursor: pointer; font-size: 0.88em; font-weight: 500; transition: all 0.2s; }
+    .checkbox-option:hover { border-color: #667eea; background: #f0f0ff; }
+    .checkbox-option input[type="checkbox"] { width: 18px; height: 18px; accent-color: #667eea; }
     .divider { height: 1px; background: linear-gradient(to right, transparent, #e2e8f0, transparent); margin: 25px 0; }
-    @media (max-width: 500px) { .features { grid-template-columns: 1fr; } .topics-grid, .frequency-options { grid-template-columns: 1fr; } .card { padding: 25px 20px; } }
+    .btn { display: block; width: 100%; padding: 16px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; border: none; border-radius: 14px; font-size: 1.1em; font-weight: 600; cursor: pointer; margin-top: 25px; font-family: 'Poppins', sans-serif; transition: all 0.3s; box-shadow: 0 8px 25px rgba(102, 126, 234, 0.35); }
+    .btn:hover { transform: translateY(-2px); box-shadow: 0 12px 35px rgba(102, 126, 234, 0.5); }
+    .inline-check { display: flex; align-items: center; gap: 10px; margin-top: 15px; font-size: 0.88em; font-weight: 500; cursor: pointer; }
+    .inline-check input { width: 18px; height: 18px; accent-color: #667eea; }
+    @media (max-width: 500px) { .checkbox-grid { grid-template-columns: 1fr; } .radio-group { flex-direction: column; } .card { padding: 25px 18px; } }
   </style>
   <script>
-    function updateTopics() {
-      var year = document.getElementById('year').value;
-      var yearNum = parseInt(year.replace('Year ', ''));
-      document.getElementById('year3-topics').style.display = (yearNum >= 1 && yearNum <= 5) ? 'block' : 'none';
-      document.getElementById('year8-topics').style.display = (yearNum >= 6 && yearNum <= 9) ? 'block' : 'none';
+    function toggleChildEmail() {
+      var same = document.getElementById('sameAsParent').checked;
+      var childEmailField = document.getElementById('childEmailField');
+      childEmailField.style.display = same ? 'none' : 'block';
+      document.getElementById('childEmail').required = !same;
     }
   </script>
   </head><body><div class="container">
   <div class="header">
-    <div class="logo">\ud83e\udde0</div>
+    <div class="logo">🧠</div>
     <h1>QuizBot</h1>
-    <p>AI-powered daily revision quizzes delivered to your inbox</p>
-  </div>
-  <div class="features">
-    <div class="feature"><div class="icon">\ud83c\udfaf</div><div class="text">Personalised<br>Questions</div></div>
-    <div class="feature"><div class="icon">\ud83d\udcca</div><div class="text">Progress<br>Tracking</div></div>
-    <div class="feature"><div class="icon">\ud83d\udce7</div><div class="text">Daily Email<br>Reminders</div></div>
+    <p>AI-powered daily revision quizzes for your child</p>
   </div>
   <div class="card">
     <form method="POST" action="/register">
-      <div class="field"><label>\ud83d\udc67 Kid's Name</label><input type="text" name="name" placeholder="e.g. Alex" required></div>
-      <div class="field"><label>\ud83c\udfeb Year Group</label>
-        <select name="year" id="year" onchange="updateTopics()" required>
+
+      <div class="section-title">👨‍👩‍👧 Parent Details</div>
+      <div class="field"><label>Full Name</label><input type="text" name="parentName" placeholder="Your full name" required></div>
+      <div class="field"><label>Phone Number</label><input type="tel" name="phone" placeholder="07xxx xxxxxx" required></div>
+      <div class="field"><label>Email Address</label><input type="email" name="parentEmail" id="parentEmail" placeholder="parent@email.com" required></div>
+
+      <div class="divider"></div>
+
+      <div class="section-title">👧 Child Details</div>
+      <div class="field"><label>Child's Name</label><input type="text" name="childName" placeholder="e.g. Alex" required></div>
+      <div class="field"><label>School Year</label>
+        <select name="year" required>
           <option value="">Select year...</option>
+          <option value="Year 1">Year 1</option>
+          <option value="Year 2">Year 2</option>
           <option value="Year 3">Year 3</option>
           <option value="Year 4">Year 4</option>
           <option value="Year 5">Year 5</option>
@@ -661,172 +569,141 @@ app.get("/register", (req, res) => {
           <option value="Year 7">Year 7</option>
           <option value="Year 8">Year 8</option>
           <option value="Year 9">Year 9</option>
+          <option value="Year 10">Year 10</option>
+          <option value="Year 11">Year 11</option>
         </select>
       </div>
-      <div class="field"><label>\ud83d\udce8 Kid's Email (quiz link sent here)</label><input type="email" name="kidEmail" placeholder="kid@email.com" required></div>
-      <div class="field"><label>\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67 Parent's Email (results sent here)</label><input type="email" name="parentEmail" placeholder="parent@email.com" required></div>
-      <div class="field"><label>\ud83d\udcdd Questions per Quiz</label><input type="number" name="questionsPerQuiz" value="20" min="5" max="40"></div>
+      <div class="field"><label>Child's Email Address</label>
+        <div class="radio-group" style="margin-bottom:10px;">
+          <label class="radio-option"><input type="radio" name="emailChoice" value="same" id="sameAsParent" onchange="toggleChildEmail()" checked> Same as parent's email</label>
+          <label class="radio-option"><input type="radio" name="emailChoice" value="different" onchange="toggleChildEmail()"> Different email</label>
+        </div>
+        <div id="childEmailField" style="display:none;"><input type="email" name="childEmail" id="childEmail" placeholder="child@email.com"></div>
+      </div>
 
       <div class="divider"></div>
 
-      <div class="field"><label>\ud83d\udcc5 How often?</label>
-        <div class="frequency-options">
-          <label class="freq-option"><input type="radio" name="frequency" value="2"> 2x per week</label>
-          <label class="freq-option"><input type="radio" name="frequency" value="3" checked> 3x per week</label>
-          <label class="freq-option"><input type="radio" name="frequency" value="5"> Mon\u2013Fri</label>
-          <label class="freq-option"><input type="radio" name="frequency" value="7"> Every day</label>
+      <div class="section-title">📚 Subject Selection</div>
+      <div class="field">
+        <div class="checkbox-grid">
+          <label class="checkbox-option"><input type="checkbox" name="subjects" value="maths" checked> 📐 Maths</label>
+          <label class="checkbox-option"><input type="checkbox" name="subjects" value="science" checked> 🔬 Science</label>
+          <label class="checkbox-option"><input type="checkbox" name="subjects" value="english"> 📖 English</label>
+          <label class="checkbox-option"><input type="checkbox" name="subjects" value="history"> 🏛️ History</label>
         </div>
       </div>
 
       <div class="divider"></div>
 
-      <div class="field"><label>\ud83d\udcda Topics to Cover</label>
-        <div id="year3-topics" style="display:none;">
-          <div class="subject-header">\ud83d\udcd0 Maths</div>
-          <div class="topics-grid">
-            <label><input type="checkbox" name="topics" value="maths:Addition" checked> Addition</label>
-            <label><input type="checkbox" name="topics" value="maths:Subtraction" checked> Subtraction</label>
-            <label><input type="checkbox" name="topics" value="maths:Multiplication" checked> Multiplication</label>
-            <label><input type="checkbox" name="topics" value="maths:Division" checked> Division</label>
-          </div>
-          <div class="subject-header">\ud83d\udcd6 English</div>
-          <div class="topics-grid">
-            <label><input type="checkbox" name="topics" value="english:Spelling" checked> Spelling</label>
-            <label><input type="checkbox" name="topics" value="english:Punctuation" checked> Punctuation</label>
-            <label><input type="checkbox" name="topics" value="english:Conjunctions" checked> Conjunctions</label>
-            <label><input type="checkbox" name="topics" value="english:Prepositions"> Prepositions</label>
-            <label><input type="checkbox" name="topics" value="english:Adjectives"> Adjectives</label>
-            <label><input type="checkbox" name="topics" value="english:Adverbs"> Adverbs</label>
-            <label><input type="checkbox" name="topics" value="english:Nouns"> Nouns</label>
-            <label><input type="checkbox" name="topics" value="english:Verbs and Tenses"> Verbs & Tenses</label>
-          </div>
-          <div class="subject-header">\ud83d\udd2c Science</div>
-          <div class="topics-grid">
-            <label><input type="checkbox" name="topics" value="science:Plants" checked> Plants</label>
-            <label><input type="checkbox" name="topics" value="science:Animals"> Animals</label>
-            <label><input type="checkbox" name="topics" value="science:Materials"> Materials</label>
-            <label><input type="checkbox" name="topics" value="science:Light"> Light</label>
-          </div>
+      <div class="section-title">📅 Test Frequency</div>
+      <div class="field">
+        <div class="radio-group">
+          <label class="radio-option"><input type="radio" name="frequency" value="biweekly"> Bi-weekly</label>
+          <label class="radio-option"><input type="radio" name="frequency" value="daily" checked> Daily practice</label>
         </div>
-
-        <div id="year8-topics" style="display:none;">
-          <div class="subject-header">\ud83d\udcd0 Maths</div>
-          <div class="topics-grid">
-            <label><input type="checkbox" name="topics" value="maths:Algebra" checked> Algebra</label>
-            <label><input type="checkbox" name="topics" value="maths:Bearings" checked> Bearings</label>
-            <label><input type="checkbox" name="topics" value="maths:Compound Shapes" checked> Compound Shapes</label>
-            <label><input type="checkbox" name="topics" value="maths:Circles" checked> Circles</label>
-            <label><input type="checkbox" name="topics" value="maths:Angles" checked> Angles</label>
-            <label><input type="checkbox" name="topics" value="maths:Probability" checked> Probability</label>
-            <label><input type="checkbox" name="topics" value="maths:Percentages" checked> Percentages</label>
-          </div>
-          <div class="subject-header">\ud83d\udd2c Science</div>
-          <div class="topics-grid">
-            <label><input type="checkbox" name="topics" value="science:Forces" checked> Forces</label>
-            <label><input type="checkbox" name="topics" value="science:Electromagnetism" checked> Electromagnetism</label>
-            <label><input type="checkbox" name="topics" value="science:Work Done" checked> Work Done</label>
-            <label><input type="checkbox" name="topics" value="science:Periodic Table" checked> Periodic Table</label>
-            <label><input type="checkbox" name="topics" value="science:Chemical Reactions" checked> Chemical Reactions</label>
-            <label><input type="checkbox" name="topics" value="science:Photosynthesis"> Photosynthesis</label>
-            <label><input type="checkbox" name="topics" value="science:Cells"> Cells</label>
-          </div>
-        </div>
-        <p style="color:#94a3b8;font-size:0.8em;margin-top:8px;font-style:italic;">Select a year group above to see available topics</p>
       </div>
 
-      <button class="btn" type="submit">\ud83d\ude80 Start Free Daily Quizzes</button>
+      <div class="divider"></div>
+
+      <div class="field"><label>📝 Additional Notes (optional)</label><textarea name="notes" placeholder="Any specific topics, learning goals, or things we should know..."></textarea></div>
+
+      <label class="inline-check"><input type="checkbox" name="sendNow" value="yes"> 🚀 Send me a practice test link immediately</label>
+
+      <button class="btn" type="submit">Register Now</button>
     </form>
-    <div class="note">\ud83d\udca1 <strong>How it works:</strong> Your child receives a personalised quiz link via email. After completing it, you get their score and topic breakdown automatically. Questions adapt based on performance!</div>
-  </div></div></body></html>`;
-
-  res.send(html);
+  </div></div></body></html>`);
 });
 
 app.post("/register", async (req, res) => {
-  const { name, year, kidEmail, parentEmail, questionsPerQuiz, topics, frequency } = req.body;
+  const { parentName, phone, parentEmail, childName, year, emailChoice, childEmail, subjects, frequency, notes, sendNow } = req.body;
 
-  if (!name || !year || !kidEmail || !parentEmail) {
+  if (!parentName || !phone || !parentEmail || !childName || !year) {
     return res.status(400).send("<h1>Missing fields</h1><p>Please fill in all required fields.</p><a href='/register'>Go back</a>");
   }
 
-  // Parse topics into subjects object
-  const subjects = {};
-  const topicList = Array.isArray(topics) ? topics : (topics ? [topics] : []);
-  for (const t of topicList) {
-    const [subject, topic] = t.split(":");
-    if (!subjects[subject]) subjects[subject] = [];
-    subjects[subject].push(topic);
+  const kidEmail = emailChoice === 'same' ? parentEmail : childEmail;
+  if (!kidEmail) {
+    return res.status(400).send("<h1>Missing email</h1><p>Please provide child's email.</p><a href='/register'>Go back</a>");
   }
 
-  if (Object.keys(subjects).length === 0) {
-    return res.status(400).send("<h1>No topics selected</h1><p>Please select at least one topic.</p><a href='/register'>Go back</a>");
+  // Parse subjects array
+  const subjectList = Array.isArray(subjects) ? subjects : (subjects ? [subjects] : []);
+  if (subjectList.length === 0) {
+    return res.status(400).send("<h1>No subjects selected</h1><p>Please select at least one subject.</p><a href='/register'>Go back</a>");
   }
 
-  // Save to MongoDB (or fallback to config.json)
+  // Build subjects object - topics will be auto-generated by Gemini based on year group
+  const subjectsObj = {};
+  for (const s of subjectList) {
+    subjectsObj[s] = []; // empty = Gemini picks age-appropriate topics
+  }
+
   const userDoc = {
-    name,
+    name: childName,
+    parentName,
+    phone,
     email: kidEmail,
     parentEmail,
     year,
-    questionsPerQuiz: Math.min(40, Math.max(5, parseInt(questionsPerQuiz) || 20)),
-    frequency: parseInt(frequency) || 5,
-    subjects,
+    questionsPerQuiz: 25,
+    frequency: frequency === 'biweekly' ? 'biweekly' : 'daily',
+    subjects: subjectsObj,
+    notes: notes || '',
     active: true,
     createdAt: new Date()
   };
 
-  if (db) {
-    await db.collection("users").updateOne({ name }, { $set: userDoc }, { upsert: true });
-  } else {
-    const config = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
-    config[name] = { email: kidEmail, parentEmail, year, questionsPerQuiz: userDoc.questionsPerQuiz, frequency: userDoc.frequency, subjects };
-    fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
+  if (!db) {
+    return res.status(500).send("<h1>Database not connected</h1><p>Please try again later.</p>");
+  }
+
+  await db.collection("users").updateOne({ name: childName }, { $set: userDoc }, { upsert: true });
+
+  // Send immediate test if requested
+  if (sendNow === 'yes') {
+    const quizUrl = `${QUIZ_URL}/quiz/${childName}`;
+    const body = `Hi ${childName}!\n\nYour first practice test is ready: ${quizUrl}\n\nGood luck! \ud83d\ude80`;
+    sendEmail(kidEmail, `\ud83d\udcda Your Practice Test is Ready!`, body);
   }
 
   // Success page
   res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Registration Complete</title>
+  <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600;700&display=swap" rel="stylesheet">
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: 'Segoe UI', sans-serif; background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%); min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px; }
+    body { font-family: 'Poppins', sans-serif; background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%); min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px; }
     .card { background: white; border-radius: 16px; padding: 40px; max-width: 500px; text-align: center; box-shadow: 0 8px 30px rgba(0,0,0,0.15); }
     .emoji { font-size: 4em; margin-bottom: 15px; }
     h1 { color: #333; margin-bottom: 10px; }
-    p { color: #555; font-size: 1.1em; margin: 10px 0; }
+    p { color: #555; font-size: 1.05em; margin: 10px 0; }
     .details { background: #f0f4ff; border-radius: 10px; padding: 15px; margin: 20px 0; text-align: left; }
-    .details p { font-size: 0.95em; margin: 5px 0; }
-    .btn { display: inline-block; padding: 12px 30px; background: #11998e; color: white; border-radius: 8px; text-decoration: none; margin-top: 20px; font-size: 1.1em; }
+    .details p { font-size: 0.9em; margin: 5px 0; }
+    .btn { display: inline-block; padding: 12px 30px; background: linear-gradient(135deg, #667eea, #764ba2); color: white; border-radius: 8px; text-decoration: none; margin-top: 20px; font-size: 1em; font-weight: 600; }
   </style></head><body>
   <div class="card">
-    <div class="emoji">🎉</div>
-    <h1>Welcome, ${name}!</h1>
-    <p>You're all set for daily quizzes!</p>
+    <div class="emoji">\ud83c\udf89</div>
+    <h1>Welcome, ${childName}!</h1>
+    <p>You're all set for ${frequency === 'biweekly' ? 'bi-weekly' : 'daily'} quizzes!</p>
     <div class="details">
-      <p><strong>Year:</strong> ${year}</p>
+      <p><strong>Child:</strong> ${childName} (${year})</p>
       <p><strong>Quiz email:</strong> ${kidEmail}</p>
-      <p><strong>Parent email:</strong> ${parentEmail}</p>
-      <p><strong>Questions:</strong> ${questionsPerQuiz || 20} per quiz</p>
-      <p><strong>Topics:</strong> ${topicList.map(t => t.split(":")[1]).join(", ")}</p>
-      <p><strong>Frequency:</strong> ${frequency || 5} days per week</p>
+      <p><strong>Parent:</strong> ${parentName} (${parentEmail})</p>
+      <p><strong>Subjects:</strong> ${subjectList.join(', ')}</p>
+      <p><strong>Frequency:</strong> ${frequency === 'biweekly' ? 'Bi-weekly' : 'Daily'}</p>
     </div>
-    <p>📧 Daily quiz link will arrive at 11:00 AM</p>
-    <a class="btn" href="/quiz/${name}">▶️ Try Your First Quiz Now</a>
+    ${sendNow === 'yes' ? '<p>\ud83d\ude80 A practice test link has been sent!</p>' : '<p>\ud83d\udce7 First quiz link will arrive at 11:00 AM</p>'}
+    <a class="btn" href="/quiz/${childName}">\u25b6\ufe0f Try a Quiz Now</a>
   </div></body></html>`);
 });
 
-// Backwards compatibility routes
+// Home redirects to register
 app.get("/", (req, res) => {
-  res.redirect("/quiz/Aakhya");
-});
-
-app.get("/year3", (req, res) => {
-  res.redirect("/quiz/Kahaan");
+  res.redirect("/register");
 });
 
 // History endpoints
-app.get("/history/:userName", (req, res) => res.json(getResults(req.params.userName)));
-app.get("/history", (req, res) => res.json(getResults("Aakhya")));
-app.get("/year3/history", (req, res) => res.json(getResults("Kahaan")));
+app.get("/history/:userName", async (req, res) => res.json(await getResults(req.params.userName)));
 
 // Config endpoint - view/update config
 app.get("/config", async (req, res) => {
@@ -865,11 +742,17 @@ app.get("/test-email", async (req, res) => {
 
 connectDB().then(async () => {
   app.listen(PORT, async () => {
-    const config = await getConfig();
-    const userNames = Object.keys(config);
     console.log(`\n📚 Quiz server running at http://localhost:${PORT}`);
-    userNames.forEach(userName => {
-      console.log(`   ${userName} (${config[userName].year}): http://localhost:${PORT}/quiz/${userName}`);
-    });
+    console.log(`   Register: http://localhost:${PORT}/register`);
+    if (db) {
+      try {
+        const config = await getConfig();
+        Object.keys(config).forEach(userName => {
+          console.log(`   ${userName} (${config[userName].year}): http://localhost:${PORT}/quiz/${userName}`);
+        });
+      } catch (e) { /* no users yet */ }
+    } else {
+      console.log('   ⚠️ No database - register page available, quizzes need MongoDB');
+    }
   });
 });
